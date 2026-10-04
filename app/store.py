@@ -4,13 +4,17 @@ Each history is one table row holding the fixed ``replica_ids`` and the full
 event list (canonical JSON).  Import sessions are one row each: the owning
 history id, an ``open``/``closed`` status and the staged events (canonical
 JSON), so an interrupted staging process can be resumed after a restart.
-Every request opens a short-lived connection:
+Per-replica delivery receipts (the causal prefix each receiving replica has
+acknowledged) are one row each as well; they are rewritten together with the
+history row when a new replica is admitted, so a reader can never observe a
+mixed replica set.  Every request opens a short-lived connection:
 
 * writes take a ``BEGIN IMMEDIATE`` transaction, which acquires the database
   reserved lock up front.  Concurrent writers therefore serialise, and a
-  read-modify-write sequence (merge / conflict commit / session commit) can
-  never interleave with another one -- no lost events, no double-allocated
-  seqs, no stale ``versions`` overwriting a conflict;
+  read-modify-write sequence (merge / conflict commit / session commit /
+  receipt report) can never interleave with another one -- no lost events, no
+  double-allocated seqs, no stale ``versions`` overwriting a conflict, and no
+  receipt regression overwriting a larger acknowledged prefix;
 * readers run on autocommit snapshot reads and never block on writers (WAL).
   A history row stores ``replica_ids`` and ``events`` together, so a single
   SELECT always yields both from the same committed state.
@@ -42,6 +46,12 @@ CREATE TABLE IF NOT EXISTS import_sessions (
     history_id  TEXT NOT NULL,
     status      TEXT NOT NULL,
     events      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS receipts (
+    history_id  TEXT NOT NULL,
+    replica_id  TEXT NOT NULL,
+    known_clock TEXT NOT NULL,
+    PRIMARY KEY (history_id, replica_id)
 );
 """
 
@@ -96,6 +106,11 @@ def read_transaction() -> Iterator[sqlite3.Connection]:
     Before any writer has created the schema (or when the database file does
     not exist at all) it yields ``None``: nothing can be stored in a
     non-existent schema.
+
+    Only the two original tables gate readiness: a database created by an
+    older release (without the ``receipts`` table) stays readable -- the
+    newer receipt queries simply see no rows -- so mounting an old data
+    volume keeps every old endpoint working unchanged.
     """
 
     try:
@@ -307,3 +322,79 @@ def select_sessions_for_update(
         "WHERE history_id = ? ORDER BY id",
         (history_id,),
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Delivery receipts: per-replica acknowledged causal prefixes
+#
+# One row per (history, receiving replica).  The acknowledged clock covers
+# exactly the history's current replica_ids; admitting a new replica appends
+# a zero component to every stored receipt and commits those rewrites in the
+# same transaction as the history row, so a reader always pairs one replica
+# set with one-shape receipts.
+# ---------------------------------------------------------------------------
+
+
+def _receipts_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'receipts'"
+    ).fetchone()[0] == 1
+
+
+def select_receipts_for_update(
+    conn: sqlite3.Connection, history_id: str
+) -> list[sqlite3.Row]:
+    """All delivery receipts of one history, ordered by replica_id.
+
+    Returns an empty list when the table is absent, i.e. when the database
+    file was created by an older release: the old data volume keeps working
+    and receipts simply start from no reports.
+    """
+
+    if not _receipts_table_exists(conn):
+        return []
+    return conn.execute(
+        "SELECT history_id, replica_id, known_clock FROM receipts "
+        "WHERE history_id = ? ORDER BY replica_id",
+        (history_id,),
+    ).fetchall()
+
+
+def upsert_receipt(
+    conn: sqlite3.Connection,
+    history_id: str,
+    replica_id: str,
+    known_clock: dict[str, int],
+) -> None:
+    """Insert or replace one receiving replica's acknowledged prefix."""
+
+    import json
+
+    conn.execute(
+        "INSERT INTO receipts (history_id, replica_id, known_clock) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(history_id, replica_id) DO UPDATE SET "
+        "known_clock = excluded.known_clock",
+        (history_id, replica_id, json.dumps(known_clock, ensure_ascii=False)),
+    )
+
+
+def update_receipt_clocks(
+    conn: sqlite3.Connection,
+    receipts: list[tuple[str, str, dict[str, int]]],
+) -> None:
+    """Rewrite several receipts in the caller's transaction.
+
+    Used by replica admission, which appends the new replica's zero component
+    to every previously stored acknowledgement together with the history row.
+    """
+
+    import json
+
+    conn.executemany(
+        "UPDATE receipts SET known_clock = ? WHERE history_id = ? AND replica_id = ?",
+        [
+            (json.dumps(clock, ensure_ascii=False), history_id, replica_id)
+            for history_id, replica_id, clock in receipts
+        ],
+    )

@@ -5485,3 +5485,409 @@ def test_concurrent_reads_never_observe_mixed_replica_sets():
         seen_sets = [f.result() for f in futures]
 
     assert any(("r1", "r2", "r3") in s for s in seen_sets)
+
+
+# ---------------------------------------------------------------------------
+# Delivery receipts: acknowledged causal prefixes + stable watermark
+# ---------------------------------------------------------------------------
+
+
+def receipt_post(hid, replica_id, known_clock):
+    return client.post(
+        f"/api/histories/{hid}/receipts",
+        json={"replica_id": replica_id, "known_clock": known_clock},
+    )
+
+
+def receipt_get(hid):
+    return client.get(f"/api/histories/{hid}/receipts")
+
+
+def test_receipts_query_with_no_reports_is_all_zero():
+    hid = admit_seed_history()
+    r = receipt_get(hid)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == hid
+    assert data["replica_ids"] == ["r1", "r2"]
+    assert data["receipts"] == []
+    assert data["stable_clock"] == {"r1": 0, "r2": 0}
+
+
+def test_receipt_report_persists_and_watermark_is_componentwise_min():
+    # r2's tail is causally independent of r1: a receiver can hold r2/1..2
+    # without knowing any r1 event, so a lagging prefix is genuinely valid.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "a", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "b", put="b", clock={"r1": 0, "r2": 1}),
+            ev("r2", 2, "b", put="b2", clock={"r1": 0, "r2": 2}),
+        ],
+    ).json()["id"]
+
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 2})
+    assert r.status_code == 200, r.text
+    assert r.json()["receipt"] == {
+        "replica_id": "r1",
+        "known_clock": {"r1": 1, "r2": 2},
+    }
+    # With only one report, the other receiver (r2) counts as all zero.
+    assert r.json()["stable_clock"] == {"r1": 0, "r2": 0}
+
+    # The second receiver lags on r1 (its own r2 tail never saw r1): the
+    # componentwise minimum drops that component.
+    r = receipt_post(hid, "r2", {"r1": 0, "r2": 2})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [x["replica_id"] for x in data["receipts"]] == ["r1", "r2"]
+    assert data["receipts"] == [
+        {"replica_id": "r1", "known_clock": {"r1": 1, "r2": 2}},
+        {"replica_id": "r2", "known_clock": {"r1": 0, "r2": 2}},
+    ]
+    assert data["stable_clock"] == {"r1": 0, "r2": 2}
+
+    # Catching up raises the common watermark; GET returns the same state.
+    assert receipt_post(hid, "r2", {"r1": 1, "r2": 2}).status_code == 200
+    got = receipt_get(hid).json()
+    assert got["stable_clock"] == {"r1": 1, "r2": 2}
+    assert [x["replica_id"] for x in got["receipts"]] == ["r1", "r2"]
+
+
+def test_receipt_all_zero_report_is_listed_and_watermark_stays_zero():
+    hid = admit_seed_history()
+    assert receipt_post(hid, "r1", {"r1": 0, "r2": 0}).status_code == 200
+    data = receipt_get(hid).json()
+    assert data["receipts"] == [
+        {"replica_id": "r1", "known_clock": {"r1": 0, "r2": 0}}
+    ]
+    assert data["stable_clock"] == {"r1": 0, "r2": 0}
+
+
+def test_receipt_identical_retransmission_succeeds():
+    hid = admit_seed_history()
+    clock = {"r1": 1, "r2": 2}
+    first = receipt_post(hid, "r1", clock)
+    assert first.status_code == 200, first.text
+    second = receipt_post(hid, "r1", dict(clock))
+    assert second.status_code == 200, second.text
+    assert second.json()["receipt"] == first.json()["receipt"]
+    # Exactly one stored receipt row.
+    assert len(receipt_get(hid).json()["receipts"]) == 1
+
+
+def test_receipt_regression_is_409_and_changes_nothing():
+    hid = admit_seed_history()
+    assert receipt_post(hid, "r1", {"r1": 1, "r2": 2}).status_code == 200
+    before = receipt_get(hid).json()
+
+    # One component moves backwards, even though another grows.
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 1})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "receipt_regressed"
+    assert detail[0]["replica_id"] == "r1"
+    assert detail[0]["regressed"] == {"r2": {"stored": 2, "incoming": 1}}
+
+    assert receipt_get(hid).json() == before
+
+    # Advancing only is fine afterwards.
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 2})
+    assert r.status_code == 200
+
+
+def test_receipt_coverage_errors_are_422():
+    hid = admit_seed_history()
+
+    r = receipt_post(hid, "r1", {"r1": 1})
+    assert_422(r, "known_clock_coverage")
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 2, "r3": 0})
+    assert_422(r, "known_clock_coverage")
+    # Not stored after failed reports.
+    assert receipt_get(hid).json()["receipts"] == []
+
+
+def test_receipt_component_beyond_committed_max_seq_is_422():
+    hid = admit_seed_history()  # r1 max seq 1, r2 max seq 2.
+    r = receipt_post(hid, "r1", {"r1": 2, "r2": 2})
+    assert_422(r, "known_clock_ahead_of_batch")
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 3})
+    assert_422(r, "known_clock_ahead_of_batch")
+    assert receipt_get(hid).json()["receipts"] == []
+
+
+def test_receipt_received_event_clock_beyond_prefix_is_422():
+    # r2/2's clock is {r1:1, r2:2}; reporting it received while the r1
+    # component is 0 is inconsistent -> 422, nothing stored.
+    hid = admit_seed_history()
+    r = receipt_post(hid, "r2", {"r1": 0, "r2": 2})
+    assert_422(r, "clock_exceeds_known_clock")
+    assert receipt_get(hid).json()["receipts"] == []
+
+    # The same claim with r1=1 is valid.
+    assert receipt_post(hid, "r2", {"r1": 1, "r2": 2}).status_code == 200
+
+
+def test_receipt_negative_and_boolean_components_are_422():
+    hid = admit_seed_history()
+    assert receipt_post(hid, "r1", {"r1": -1, "r2": 0}).status_code == 422
+    assert receipt_post(hid, "r1", {"r1": True, "r2": 0}).status_code == 422
+    assert receipt_post(hid, "r1", {"r1": 0, "r2": False}).status_code == 422
+    # Booleans in replica_id position / extra fields also fail the schema.
+    assert client.post(
+        f"/api/histories/{hid}/receipts",
+        json={"replica_id": True, "known_clock": {"r1": 0, "r2": 0}},
+    ).status_code == 422
+    assert client.post(
+        f"/api/histories/{hid}/receipts",
+        json={
+            "replica_id": "r1",
+            "known_clock": {"r1": 0, "r2": 0},
+            "extra": 1,
+        },
+    ).status_code == 422
+    assert receipt_get(hid).json()["receipts"] == []
+
+
+def test_receipt_unknown_history_and_unknown_replica_are_404():
+    r = receipt_get("0" * 32)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+    r = receipt_post("0" * 32, "r1", {"r1": 0, "r2": 0})
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+    hid = admit_seed_history()
+    r = receipt_post(hid, "r9", {"r1": 0, "r2": 0})
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "receipt_replica_not_found"
+    assert receipt_get(hid).json()["receipts"] == []
+
+
+def test_receipts_ignore_staged_events():
+    hid = admit_seed_history()
+    sid = create_session(hid)
+    # A staged (uncommitted) r1/2 extends r1's tail only inside the session.
+    assert session_append(
+        hid, sid, [ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 2})]
+    ).status_code == 200
+
+    # Committed max seq for r1 is still 1: claiming r1=2 is 422, and a
+    # history read does not include the staged event either.
+    r = receipt_post(hid, "r1", {"r1": 2, "r2": 2})
+    assert_422(r, "known_clock_ahead_of_batch")
+
+    # After committing, the report is valid.
+    assert session_commit(hid, sid).status_code == 200
+    assert receipt_post(hid, "r1", {"r1": 2, "r2": 2}).status_code == 200
+
+
+def test_receipts_survive_process_restart(tmp_path):
+    db = tmp_path / "history.db"
+    env = dict(os.environ, HISTORY_DB_PATH=str(db), PYTHONPATH="/workspace")
+
+    def run(code):
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            env=env, capture_output=True, text=True,
+        )
+
+    first = run(
+        """
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'name', 'put': 'alice',
+         'clock': {'r1': 1, 'r2': 0}},
+    ],
+})
+hid = r.json()['id']
+r = c.post(f'/api/histories/{hid}/receipts', json={
+    'replica_id': 'r1', 'known_clock': {'r1': 1, 'r2': 0}})
+assert r.status_code == 200, r.text
+print(hid)
+"""
+    )
+    assert first.returncode == 0, first.stderr
+    hid = first.stdout.strip()
+
+    second = run(
+        f"""
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.get('/api/histories/{hid}/receipts')
+assert r.status_code == 200, r.text
+data = r.json()
+assert data['receipts'] == [
+    {{'replica_id': 'r1', 'known_clock': {{'r1': 1, 'r2': 0}}}}
+]
+# r2 never reported -> its all-zero contribution keeps the watermark at zero.
+assert data['stable_clock'] == {{'r1': 0, 'r2': 0}}
+print('ok')
+"""
+    )
+    assert second.returncode == 0, second.stderr
+    assert second.stdout.strip() == "ok"
+
+
+def test_receipts_after_admission_old_reports_padded_new_receiver_zero():
+    hid = admit_seed_history()
+    assert receipt_post(hid, "r1", {"r1": 1, "r2": 2}).status_code == 200
+    assert receipt_post(hid, "r2", {"r1": 1, "r2": 2}).status_code == 200
+    assert receipt_get(hid).json()["stable_clock"] == {"r1": 1, "r2": 2}
+
+    # Admit r3: every old receipt gains r3=0, the new receiver is all zero,
+    # and the watermark drops componentwise.
+    assert hist_admit(hid, "r3").status_code == 200
+    data = receipt_get(hid).json()
+    assert data["replica_ids"] == ["r1", "r2", "r3"]
+    assert data["receipts"] == [
+        {"replica_id": "r1", "known_clock": {"r1": 1, "r2": 2, "r3": 0}},
+        {"replica_id": "r2", "known_clock": {"r1": 1, "r2": 2, "r3": 0}},
+    ]
+    assert data["stable_clock"] == {"r1": 0, "r2": 0, "r3": 0}
+
+    # Pre-admission two-component clocks are no longer valid reports (422),
+    # and r3 itself can now report.
+    assert_422(receipt_post(hid, "r1", {"r1": 1, "r2": 2}), "known_clock_coverage")
+    assert receipt_post(hid, "r3", {"r1": 1, "r2": 2, "r3": 0}).status_code == 200
+    data = receipt_get(hid).json()
+    assert [x["replica_id"] for x in data["receipts"]] == ["r1", "r2", "r3"]
+    assert data["stable_clock"] == {"r1": 1, "r2": 2, "r3": 0}
+
+    # A regression is still rejected across the padded component.
+    r = receipt_post(hid, "r1", {"r1": 1, "r2": 1, "r3": 0})
+    assert r.status_code == 409
+    assert r.json()["detail"][0]["code"] == "receipt_regressed"
+
+
+def test_concurrent_receipt_reports_never_overwrite_larger_progress():
+    # Both receivers advance repeatedly in parallel; the final receipts must
+    # equal the largest clock each one ever reported, and no report may lose.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", n, f"k{n}", put="a", clock={"r1": n, "r2": n - 1})
+            if n > 1
+            else ev("r1", n, f"k{n}", put="a", clock={"r1": n, "r2": 0})
+            for n in range(1, 11)
+        ]
+        + [
+            ev("r2", n, f"j{n}", put="b", clock={"r1": n, "r2": n})
+            for n in range(1, 11)
+        ],
+    ).json()["id"]
+    barrier = threading.Barrier(2)
+
+    def report(reporter):
+        c = TestClient(app)
+        barrier.wait()
+        last = None
+        # Report in increasing order interleaved with repeats; every response
+        # must be 200 (repeats are idempotent, larger clocks advance).
+        for n in range(1, 11):
+            r = c.post(
+                f"/api/histories/{hid}/receipts",
+                json={
+                    "replica_id": reporter,
+                    "known_clock": {"r1": n, "r2": n},
+                },
+            )
+            assert r.status_code == 200, r.text
+            last = r
+        return last
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(report, ["r1", "r2"]))
+    assert all(r is not None for r in results)
+
+    data = receipt_get(hid).json()
+    assert data["receipts"] == [
+        {"replica_id": "r1", "known_clock": {"r1": 10, "r2": 10}},
+        {"replica_id": "r2", "known_clock": {"r1": 10, "r2": 10}},
+    ]
+    assert data["stable_clock"] == {"r1": 10, "r2": 10}
+
+
+def test_concurrent_admission_and_report_keep_consistent_snapshot():
+    hid = admit_seed_history()
+    assert receipt_post(hid, "r1", {"r1": 1, "r2": 2}).status_code == 200
+
+    def read_until_done(stop):
+        c = TestClient(app)
+        seen = set()
+        while not stop.is_set():
+            data = c.get(f"/api/histories/{hid}/receipts").json()
+            replicas = data["replica_ids"]
+            # Receipt clocks must cover exactly the replica set of the same
+            # response -- never a pre/post-expansion mixture.
+            for item in data["receipts"]:
+                assert set(item["known_clock"]) == set(replicas)
+            assert set(data["stable_clock"]) == set(replicas)
+            seen.add(tuple(replicas))
+        return seen
+
+    stop = threading.Event()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read_until_done, stop) for _ in range(4)]
+        time.sleep(0.05)
+        assert hist_admit(hid, "r3").status_code == 200
+        assert receipt_post(hid, "r1", {"r1": 1, "r2": 2, "r3": 0}).status_code == 200
+        time.sleep(0.05)
+        stop.set()
+        seen_sets = [f.result() for f in futures]
+
+    assert any(("r1", "r2", "r3") in s for s in seen_sets)
+    data = receipt_get(hid).json()
+    assert data["stable_clock"] == {"r1": 0, "r2": 0, "r3": 0}
+
+
+def test_legacy_database_without_receipts_table_still_serves_old_data(
+    tmp_path, monkeypatch
+):
+    """An old data volume (histories/sessions only) reads exactly as before.
+
+    The receipts table is created lazily by the first write; a read against
+    the old schema must not 500 -- receipts are simply empty and the
+    watermark zero until a report creates the table.
+    """
+
+    db = tmp_path / "history.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE histories (
+            id TEXT PRIMARY KEY, replica_ids TEXT NOT NULL, events TEXT NOT NULL
+        );
+        CREATE TABLE import_sessions (
+            id TEXT PRIMARY KEY, history_id TEXT NOT NULL,
+            status TEXT NOT NULL, events TEXT NOT NULL
+        );
+        INSERT INTO histories VALUES ('h1', '["r1","r2"]', '[]');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("HISTORY_DB_PATH", str(db))
+    try:
+        # Old endpoint unaffected by the absent receipts table.
+        r = client.get("/api/histories/h1")
+        assert r.status_code == 200
+        assert r.json()["replica_ids"] == ["r1", "r2"]
+        # Receipts query tolerates the old schema: no rows, zero watermark.
+        r = receipt_get("h1")
+        assert r.status_code == 200
+        assert r.json()["receipts"] == []
+        assert r.json()["stable_clock"] == {"r1": 0, "r2": 0}
+    finally:
+        monkeypatch.delenv("HISTORY_DB_PATH", raising=False)
