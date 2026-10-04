@@ -145,6 +145,8 @@ docker compose down
 | 提取指定键的因果证据批次（只读，可直接重放） | `POST http://localhost:8000/api/histories/{id}/evidence-batch` |
 | 解释两条事件的因果关系（只读，可跨 key） | `POST http://localhost:8000/api/histories/{id}/event-relation` |
 | 接纳新副本（追加到 replica_ids，扩展全部 clock 与会话暂存） | `POST http://localhost:8000/api/histories/{id}/replicas` |
+| 上报一个接收副本已确认的因果前缀（持久化回执） | `POST http://localhost:8000/api/histories/{id}/receipts` |
+| 查询各接收副本回执与共同稳定水位（只读） | `GET http://localhost:8000/api/histories/{id}/receipts` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -2451,6 +2453,242 @@ curl -sS -i -X POST "http://localhost:8000/api/histories/$HID8/replicas" \
 后按原 ID 读取仍是扩容后的三副本历史；接入前后创建的**其他历史**的
 `replica_ids` 与 clock 完全不变。系统只提供加入能力，没有移除或改名副本的
 接口。
+
+## 接收回执与稳定水位接口 `/api/histories/{id}/receipts`
+
+持久历史还会记录**每个接收副本已确认的因果前缀**，并回答"**所有副本共同
+接收到的稳定水位**"在哪里。每个接收副本可以上报自己已收到的前缀
+（`known_clock`），回执与历史、会话一样持久化在同一个 SQLite 库中，容器/
+进程重启后仍可查询；**暂存会话中的事件不计入接收范围**（它们还没有进入已
+提交历史），上报失败也不改任何数据。
+
+**上报**：`POST /api/histories/{id}/receipts`，请求体：
+
+```json
+{
+  "replica_id": "r1",
+  "known_clock": {"r1": 2, "r2": 1}
+}
+```
+
+- `replica_id`：接收副本 ID，必须是该历史**当前副本集合**的成员（非空字符串）；
+- `known_clock`：该接收方已确认收到的因果前缀，必须**恰好覆盖当前全部副本**，
+  每个分量为**非负整数**（**拒绝布尔值**、字符串、浮点、负数）；
+- 任一分量不得超过该来源在**已提交历史**中的最大 `seq`（暂存事件不算）；
+- 任一**已接收事件**（自身 `seq <= known_clock[本副本]`）的 clock 都不得超出
+  此前缀；违例返回 **422**（错误码沿用 `known_clock_coverage`、
+  `known_clock_ahead_of_history`、`clock_exceeds_known_clock`）；
+- 相对该接收方**已保存的回执**，新回执的**每个分量都不得倒退**；倒退返回
+  **409**（`receipt_regressed`，错误项中逐分量列出旧值与新值）；
+  **完全相同的重传视为幂等成功**（clock 键顺序无关），前进的上报正常成功；
+- 历史不存在返回 **404**（`history_not_found`）；接收副本不是当前集合成员返回
+  **404**（`receiving_replica_not_found`）；字段缺失、空 ID、布尔/负分量等为
+  **422**。
+
+**查询**：`GET /api/histories/{id}/receipts`，返回：
+
+- `receipts`：按 `replica_id` 排序的**全部当前副本**回执，每项
+  `{replica_id, known_clock}`；**从未上报的副本（含刚接入的新副本）按全零计**，
+  也会出现在列表中；
+- `stable_clock`：**各分量取全部接收方回执的最小值**——即每一个接收方都已共同
+  接收到的因果前缀水位；任何人没上报，水位就是全零。
+
+历史行与回执行在**同一快照/同一串行化事务**中读取与更新，查询绝不会混用
+**扩容前后**的副本集合与回执。并发上报基于**同一已提交状态**完成校验与保存
+（`BEGIN IMMEDIATE` 串行化），较大的已确认进度不会被较小进度覆盖。
+
+**与新副本接入联动（同一事务生效，水位可以下降）**：接入新副本时，**旧回执
+自动补上该新副本的零分量**（已有分量不变，天然保持单调），**新接收方以全零
+计**——这与历史扩容、会话扩容**一起原子生效**；因此接入后 `stable_clock` 可能
+**整体下降**（新接收方什么都还没收到），直到新接收方也确认了共同前缀，水位
+才重新上升。接入后上报必须使用扩容后的**完整 clock**（旧的两分量 clock 是
+422，服务端不自动补分量）。
+
+状态码汇总：
+
+- **200**：上报成功（含相同重传）或查询成功；上报响应即完整回执视图
+  （与 GET 同形：`id`、`receipts`、`stable_clock`）；
+- **404**：历史不存在（`history_not_found`）或接收副本不属于该历史
+  （`receiving_replica_not_found`）；
+- **409**：回执某分量相对已存值倒退（`receipt_regressed`，逐项给出
+  `previous`/`new`）；失败不写任何数据；
+- **422**：clock 覆盖不全/有多余分量（`known_clock_coverage`）、分量超过已提交
+  最大 seq（`known_clock_ahead_of_history`）、已接收事件 clock 越界
+  （`clock_exceeds_known_clock`），或请求体结构非法（布尔值、负数、空 ID、多余
+  字段等）。
+
+### 31. 上报接收回执、查询稳定水位、扩容后重新确认
+
+先创建一份两副本历史：`r1/1` 写 `a`；`r2/1` 同步过 `r1/1` 后写 `b`；`r1/2`
+依赖 `r2/1` 再写 `a`：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "a", "put": "x",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "b", "put": "y",
+       "clock": {"r1": 1, "r2": 1}},
+      {"replica_id": "r1", "seq": 2, "key": "a", "put": "z",
+       "clock": {"r1": 2, "r2": 1}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+还没人上报时，查询把两个接收方都按全零列出，水位也是全零：
+
+```bash
+curl -sS "http://localhost:8000/api/histories/$HID/receipts"
+```
+
+```json
+{
+  "id": "…",
+  "receipts": [
+    {"replica_id": "r1", "known_clock": {"r1": 0, "r2": 0}},
+    {"replica_id": "r2", "known_clock": {"r1": 0, "r2": 0}}
+  ],
+  "stable_clock": {"r1": 0, "r2": 0}
+}
+```
+
+`r1` 上报自己已收到全部（`r1=2, r2=1`），随后 `r2` 只确认到 `(r1=1, r2=0)`——
+它持有 `r1/1`，但还没收到 `r2/1`/`r1/2`：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "known_clock": {"r1": 2, "r2": 1}}'
+
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r2", "known_clock": {"r1": 1, "r2": 0}}'
+```
+
+查询返回按副本 ID 排序的回执与逐分量最小值的水位 `(1, 0)`：
+
+```bash
+curl -sS "http://localhost:8000/api/histories/$HID/receipts"
+```
+
+```json
+{
+  "id": "…",
+  "receipts": [
+    {"replica_id": "r1", "known_clock": {"r1": 2, "r2": 1}},
+    {"replica_id": "r2", "known_clock": {"r1": 1, "r2": 0}}
+  ],
+  "stable_clock": {"r1": 1, "r2": 0}
+}
+```
+
+`r2` 补齐后再上报 `(2, 1)`，水位随之上升到所有接收方共同的前缀 `(2, 1)`：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r2", "known_clock": {"r1": 2, "r2": 1}}' \
+  | python3 -m json.tool
+# stable_clock = {"r1": 2, "r2": 1}
+```
+
+**相同重传成功，倒退 409。** 把完全相同的回执再发一次仍然是 200（幂等）；
+但把任一分量往小里报就是 409，且逐项给出旧值/新值，数据不变：
+
+```bash
+# 相同重传 -> 200
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "known_clock": {"r1": 2, "r2": 1}}'
+
+# 分量倒退 -> 409 receipt_regressed
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "known_clock": {"r1": 1, "r2": 0}}'
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "receipt_regressed",
+      "message": "the receipt of receiving replica 'r1' moves one or more components backwards; each component must be greater than or equal to the previously acknowledged one",
+      "replica_id": "r1",
+      "components": {
+        "r1": {"previous": 2, "new": 1},
+        "r2": {"previous": 1, "new": 0}
+      }
+    }
+  ]
+}
+```
+
+非法前缀同样被拒：分量超过已提交最大 seq、clock 缺/多分量、已接收事件的
+clock 超出前缀、布尔值或负数，都是 **422**；接收副本不是成员或历史不存在是
+**404**：
+
+```bash
+# r1 最高 seq 只有 2 -> 422 known_clock_ahead_of_history
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "known_clock": {"r1": 3, "r2": 1}}'
+
+# 持有 r2/1（其 clock 为 {r1:1,r2:1}）却声称 r1 分量为 0
+# -> 422 clock_exceeds_known_clock
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r2", "known_clock": {"r1": 0, "r2": 1}}'
+
+# 布尔分量 -> 422
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "known_clock": {"r1": true, "r2": 1}}'
+
+# 接收副本不是成员 -> 404 receiving_replica_not_found
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r9", "known_clock": {"r1": 0, "r2": 0}}'
+```
+
+**扩容后旧回执补零、新接收方全零，水位下降，再重新确认。** 接入新副本
+`r3`（与历史、会话扩容同一事务）：旧的 `r1`/`r2` 回执自动补上 `"r3": 0`，
+`r3` 作为新接收方按全零出现，因此共同水位整体降到全零：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/replicas" \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r3"}' > /dev/null
+
+curl -sS "http://localhost:8000/api/histories/$HID/receipts"
+```
+
+```json
+{
+  "id": "…",
+  "receipts": [
+    {"replica_id": "r1", "known_clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "known_clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r3", "known_clock": {"r1": 0, "r2": 0, "r3": 0}}
+  ],
+  "stable_clock": {"r1": 0, "r2": 0, "r3": 0}
+}
+```
+
+此时旧的两分量 clock 上报会被 422 拒绝（必须恰好覆盖三个副本）。等 `r3`
+把共同前缀也确认下来（它自己还没写事件，`r3` 分量为 0），水位回升：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r3", "known_clock": {"r1": 2, "r2": 1, "r3": 0}}'
+# stable_clock = {"r1": 2, "r2": 1, "r3": 0}
+```
+
+回执与历史一样持久化在命名卷中，`docker compose restart` 后按原 ID 查询依旧
+是扩容后的三份回执与对应水位；其他历史的回执互不可见、互不影响。
 
 ## 本地开发（不使用 Docker）
 

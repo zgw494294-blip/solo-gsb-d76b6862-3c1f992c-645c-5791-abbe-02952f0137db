@@ -5485,3 +5485,574 @@ def test_concurrent_reads_never_observe_mixed_replica_sets():
         seen_sets = [f.result() for f in futures]
 
     assert any(("r1", "r2", "r3") in s for s in seen_sets)
+
+
+# ---------------------------------------------------------------------------
+# Delivery receipts and the stable watermark
+# ---------------------------------------------------------------------------
+
+
+def receipt_seed_history():
+    """r1/1 (1,0) put a; r2/1 (1,1) put b (saw r1/1); r1/2 (2,1) put a2."""
+    r = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "a", put="x", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "b", put="y", clock={"r1": 1, "r2": 1}),
+            ev("r1", 2, "a", put="z", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def hist_receipt(hid, replica, known_clock):
+    return client.post(
+        f"/api/histories/{hid}/receipts",
+        json={"replica_id": replica, "known_clock": known_clock},
+    )
+
+
+def hist_receipts_get(hid):
+    return client.get(f"/api/histories/{hid}/receipts")
+
+
+def test_receipts_empty_query_lists_all_replicas_as_all_zero():
+    hid = receipt_seed_history()
+    r = hist_receipts_get(hid)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == hid
+    assert data["receipts"] == [
+        {"replica_id": "r1", "known_clock": {"r1": 0, "r2": 0}},
+        {"replica_id": "r2", "known_clock": {"r1": 0, "r2": 0}},
+    ]
+    assert data["stable_clock"] == {"r1": 0, "r2": 0}
+
+
+def test_receipts_submit_persists_and_stable_is_componentwise_minimum():
+    hid = receipt_seed_history()
+    r = hist_receipt(hid, "r1", {"r1": 2, "r2": 1})
+    assert r.status_code == 200, r.text
+    # POST returns the same view shape as GET.
+    assert r.json() == hist_receipts_get(hid).json()
+
+    r = hist_receipt(hid, "r2", {"r1": 1, "r2": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["stable_clock"] == {"r1": 1, "r2": 0}
+
+    # Catching the lagging receiver up raises the watermark to the prefix
+    # every receiver now shares.
+    r = hist_receipt(hid, "r2", {"r1": 2, "r2": 1})
+    assert r.json()["stable_clock"] == {"r1": 2, "r2": 1}
+    assert [x["replica_id"] for x in r.json()["receipts"]] == ["r1", "r2"]
+
+    # Persisted independently of the reporting connection.
+    assert hist_receipts_get(hid).json()["stable_clock"] == {"r1": 2, "r2": 1}
+
+
+def test_receipts_identical_retransmission_succeeds_idempotently():
+    hid = receipt_seed_history()
+    clock = {"r1": 2, "r2": 1}
+    first = hist_receipt(hid, "r1", clock)
+    assert first.status_code == 200
+    again = hist_receipt(hid, "r1", dict(clock))
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    # Clock key order is irrelevant (dict equality).
+    again2 = hist_receipt(hid, "r1", {"r2": 1, "r1": 2})
+    assert again2.status_code == 200
+    assert again2.json() == first.json()
+
+
+def test_receipts_regression_is_409_and_lists_every_regressed_component():
+    hid = receipt_seed_history()
+    assert hist_receipt(hid, "r1", {"r1": 2, "r2": 1}).status_code == 200
+
+    # Both components move backwards at once.
+    r = hist_receipt(hid, "r1", {"r1": 1, "r2": 0})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "receipt_regressed"
+    assert detail[0]["replica_id"] == "r1"
+    assert detail[0]["components"] == {
+        "r1": {"previous": 2, "new": 1},
+        "r2": {"previous": 1, "new": 0},
+    }
+
+    # A single component moving back while every received event stays inside
+    # the prefix is still a regression.  (1,1) passes the prefix checks
+    # (r1/1 and r2/1 are received and their clocks fit; r1/2 is not yet
+    # received), and only the receiver's own r1 component moves 2 -> 1.
+    r = hist_receipt(hid, "r1", {"r1": 1, "r2": 1})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"][0]["components"] == {
+        "r1": {"previous": 2, "new": 1}
+    }
+
+    # A failed regression changes nothing.
+    got = hist_receipts_get(hid).json()
+    assert got["receipts"][0]["known_clock"] == {"r1": 2, "r2": 1}
+    # r2 has never reported -> implicit all zero, so the watermark is zero.
+    assert got["stable_clock"] == {"r1": 0, "r2": 0}
+
+
+def test_receipts_first_report_can_never_regress_from_implicit_zero():
+    hid = receipt_seed_history()
+    # r2 never reported; an all-zero first submission is a normal success.
+    r = hist_receipt(hid, "r2", {"r1": 0, "r2": 0})
+    assert r.status_code == 200
+
+
+def test_receipts_unknown_history_is_404():
+    missing = "0" * 32
+    r = client.post(
+        f"/api/histories/{missing}/receipts",
+        json={"replica_id": "r1", "known_clock": {"r1": 0, "r2": 0}},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+    r = client.get(f"/api/histories/{missing}/receipts")
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+
+def test_receipts_non_member_receiving_replica_is_404():
+    hid = receipt_seed_history()
+    r = hist_receipt(hid, "r9", {"r1": 0, "r2": 0})
+    assert r.status_code == 404, r.text
+    detail = r.json()["detail"][0]
+    assert detail["code"] == "receiving_replica_not_found"
+    assert detail["replica_id"] == "r9"
+    # Nothing persisted.
+    assert hist_receipts_get(hid).json()["stable_clock"] == {"r1": 0, "r2": 0}
+
+
+def test_receipts_component_over_committed_max_seq_is_422():
+    hid = receipt_seed_history()
+    r = hist_receipt(hid, "r1", {"r1": 3, "r2": 1})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "known_clock_ahead_of_history"
+    # r2 has no events of its own at seq 2 either (its max committed seq is 1).
+    r = hist_receipt(hid, "r1", {"r1": 2, "r2": 2})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "known_clock_ahead_of_history"
+
+
+def test_receipts_clock_coverage_must_match_current_replicas():
+    hid = receipt_seed_history()
+    for bad_clock, fields in (
+        ({"r1": 2}, "missing r2"),
+        ({"r1": 2, "r2": 1, "r3": 0}, "extra r3"),
+        ({}, "empty clock"),
+    ):
+        r = hist_receipt(hid, "r1", bad_clock)
+        assert r.status_code == 422, fields
+        assert r.json()["detail"][0]["code"] == "known_clock_coverage", fields
+    # No receipt persisted by any failed attempt.
+    assert hist_receipts_get(hid).json()["receipts"][0]["known_clock"] == {
+        "r1": 0, "r2": 0
+    }
+
+
+def test_receipts_clock_components_must_be_non_negative_ints_not_booleans():
+    hid = receipt_seed_history()
+    for bad in (
+        {"r1": True, "r2": 1},          # bool rejected despite int subclass
+        {"r1": False, "r2": 1},
+        {"r1": 2, "r2": -1},            # negative
+        {"r1": "2", "r2": 1},           # string
+        {"r1": 2.0, "r2": 1},           # float
+        {"r1": None, "r2": 1},          # null
+    ):
+        r = hist_receipt(hid, "r1", bad)
+        assert r.status_code == 422, bad
+
+
+def test_receipts_schema_rejects_bad_body_shape():
+    hid = receipt_seed_history()
+    for body in (
+        {"known_clock": {"r1": 0, "r2": 0}},                  # missing replica_id
+        {"replica_id": "r1"},                                 # missing known_clock
+        {"replica_id": "r1", "known_clock": {"r1": 0, "r2": 0}, "extra": 1},
+        {"replica_id": "", "known_clock": {"r1": 0, "r2": 0}},  # empty id
+        {"replica_id": 5, "known_clock": {"r1": 0, "r2": 0}},
+        {},
+    ):
+        r = client.post(f"/api/histories/{hid}/receipts", json=body)
+        assert r.status_code == 422, body
+
+
+def test_receipts_received_event_clock_beyond_prefix_is_422():
+    # r2/1 (1,1) is "already received" when known_clock[r2] >= 1; claiming
+    # known_clock (0,1) says the receiver holds r2/1 but nothing from r1,
+    # which contradicts that event's clock (r1=1) -> 422.
+    hid = receipt_seed_history()
+    r = hist_receipt(hid, "r2", {"r1": 0, "r2": 1})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "clock_exceeds_known_clock"
+
+    # The same prefix for a different receiver is also invalid: r1 claiming
+    # (0,1) means it holds r2/1 whose clock needs r1/1.
+    r = hist_receipt(hid, "r1", {"r1": 0, "r2": 1})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "clock_exceeds_known_clock"
+
+    # The consistent prefix (1,1) is accepted.
+    assert hist_receipt(hid, "r2", {"r1": 1, "r2": 1}).status_code == 200
+
+
+def test_receipts_failed_submission_changes_nothing():
+    hid = receipt_seed_history()
+    assert hist_receipt(hid, "r1", {"r1": 2, "r2": 1}).status_code == 200
+    before = hist_receipts_get(hid).json()
+
+    # One 422 and one 409 after a successful report.
+    r = hist_receipt(hid, "r1", {"r1": 9, "r2": 9})
+    assert r.status_code == 422
+    r = hist_receipt(hid, "r1", {"r1": 0, "r2": 0})
+    assert r.status_code == 409
+    assert hist_receipts_get(hid).json() == before
+
+
+def test_receipts_are_persisted_across_process_restart(tmp_path):
+    db = tmp_path / "history.db"
+    env = dict(os.environ, HISTORY_DB_PATH=str(db), PYTHONPATH="/workspace")
+
+    def run(code):
+        return subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True
+        )
+
+    create = run(
+        """
+from fastapi.testclient import TestClient
+from app.main import app
+c = TestClient(app)
+hid = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'a', 'put': 'x',
+         'clock': {'r1': 1, 'r2': 0}},
+        {'replica_id': 'r2', 'seq': 1, 'key': 'b', 'put': 'y',
+         'clock': {'r1': 1, 'r2': 1}},
+    ],
+}).json()['id']
+assert c.post(f'/api/histories/{hid}/receipts', json={
+    'replica_id': 'r1', 'known_clock': {'r1': 1, 'r2': 1}}).status_code == 200
+assert c.post(f'/api/histories/{hid}/receipts', json={
+    'replica_id': 'r2', 'known_clock': {'r1': 1, 'r2': 0}}).status_code == 200
+print(hid)
+"""
+    )
+    assert create.returncode == 0, create.stderr
+    hid = create.stdout.strip()
+
+    read = run(
+        f"""
+from fastapi.testclient import TestClient
+from app.main import app
+c = TestClient(app)
+d = c.get('/api/histories/{hid}/receipts').json()
+assert d['stable_clock'] == {{'r1': 1, 'r2': 0}}, d
+assert d['receipts'] == [
+    {{'replica_id': 'r1', 'known_clock': {{'r1': 1, 'r2': 1}}}},
+    {{'replica_id': 'r2', 'known_clock': {{'r1': 1, 'r2': 0}}}},
+], d
+# A stale report after restart still gets 409.
+r = c.post(f'/api/histories/{hid}/receipts', json={{
+    'replica_id': 'r1', 'known_clock': {{'r1': 0, 'r2': 0}}}})
+assert r.status_code == 409
+print('ok')
+"""
+    )
+    assert read.returncode == 0, read.stderr
+    assert read.stdout.strip() == "ok"
+
+
+def test_receipts_admission_patches_old_receipts_and_watermark_drops():
+    hid = receipt_seed_history()
+    assert hist_receipt(hid, "r1", {"r1": 2, "r2": 1}).status_code == 200
+    assert hist_receipt(hid, "r2", {"r1": 2, "r2": 1}).status_code == 200
+    assert hist_receipts_get(hid).json()["stable_clock"] == {"r1": 2, "r2": 1}
+
+    # Admit r3: old receipts gain a zero component; the new receiver is
+    # implicitly all zero, so the watermark drops on every component.
+    assert hist_admit(hid, "r3").status_code == 200
+    data = hist_receipts_get(hid).json()
+    assert [x["replica_id"] for x in data["receipts"]] == ["r1", "r2", "r3"]
+    assert data["receipts"][0]["known_clock"] == {"r1": 2, "r2": 1, "r3": 0}
+    assert data["receipts"][1]["known_clock"] == {"r1": 2, "r2": 1, "r3": 0}
+    assert data["receipts"][2]["known_clock"] == {"r1": 0, "r2": 0, "r3": 0}
+    assert data["stable_clock"] == {"r1": 0, "r2": 0, "r3": 0}
+
+    # Old two-component clocks are now stale under the expanded set.
+    r = hist_receipt(hid, "r1", {"r1": 2, "r2": 1})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "known_clock_coverage"
+
+    # Once the new receiver acknowledges the shared prefix, the watermark
+    # rises; the new replica's own seq is still 0.
+    r = hist_receipt(hid, "r3", {"r1": 2, "r2": 1, "r3": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["stable_clock"] == {"r1": 2, "r2": 1, "r3": 0}
+
+    # The patched old receipts stayed monotone: old components never moved.
+    r = hist_receipt(hid, "r1", {"r1": 2, "r2": 1, "r3": 0})
+    assert r.status_code == 200
+
+
+def test_receipts_after_admission_new_replica_can_report_then_write():
+    # Admission without any prior reports: every receiver stays at zero.
+    hid = receipt_seed_history()
+    assert hist_admit(hid, "r3").status_code == 200
+    data = hist_receipts_get(hid).json()
+    assert len(data["receipts"]) == 3
+    assert all(
+        x["known_clock"] == {"r1": 0, "r2": 0, "r3": 0} for x in data["receipts"]
+    )
+    assert data["stable_clock"] == {"r1": 0, "r2": 0, "r3": 0}
+
+
+def test_receipts_work_on_legacy_volume_without_receipts_table(tmp_path, monkeypatch):
+    # A database created by the older schema (only histories/import_sessions)
+    # must still read receipts as all zeros and lazily gain the table on the
+    # first write, without losing existing data.
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE histories (
+            id TEXT PRIMARY KEY, replica_ids TEXT NOT NULL, events TEXT NOT NULL);
+        CREATE TABLE import_sessions (
+            id TEXT PRIMARY KEY, history_id TEXT NOT NULL,
+            status TEXT NOT NULL, events TEXT NOT NULL);
+        """
+    )
+    conn.execute(
+        "INSERT INTO histories VALUES (?, ?, ?)",
+        (
+            "legacyhid",
+            json.dumps(["r1", "r2"]),
+            json.dumps(
+                [ev("r1", 1, "k", put="v", clock={"r1": 1, "r2": 0})]
+            ),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("HISTORY_DB_PATH", str(db))
+    c = TestClient(app)
+    r = c.get("/api/histories/legacyhid/receipts")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [x["replica_id"] for x in data["receipts"]] == ["r1", "r2"]
+    assert data["stable_clock"] == {"r1": 0, "r2": 0}
+
+    r = c.post(
+        "/api/histories/legacyhid/receipts",
+        json={"replica_id": "r1", "known_clock": {"r1": 1, "r2": 0}},
+    )
+    assert r.status_code == 200, r.text
+    # History data is intact.
+    assert (
+        c.get("/api/histories/legacyhid").json()["replica_ids"]
+        == ["r1", "r2"]
+    )
+
+
+def test_receipts_ceiling_and_prefix_ignore_staged_events():
+    hid = receipt_seed_history()
+    sid = create_session(hid)
+    assert session_append(
+        hid, sid, [ev("r1", 3, "q", put="v", clock={"r1": 3, "r2": 1})]
+    ).status_code == 200
+
+    # The staged r1/3 does not raise the committed ceiling.
+    r = hist_receipt(hid, "r2", {"r1": 3, "r2": 1})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "known_clock_ahead_of_history"
+
+    # A prefix up to the committed r1/2 is still fine.
+    assert hist_receipt(hid, "r2", {"r1": 2, "r2": 1}).status_code == 200
+
+
+def test_receipts_concurrent_submissions_never_overwrite_greater_progress():
+    # The monotonicity guard is evaluated against the stored receipt inside
+    # the same serialised write transaction, so concurrent submissions for
+    # one receiver can never overwrite a greater progress with a smaller one:
+    # whichever order the BEGIN IMMEDIATE lock grants, the stored clock is
+    # always the greatest one a *successful* submission carried.  Hammer the
+    # endpoint from many threads with a mix of clock heights and idempotent
+    # resends and assert the final stored clock is the overall maximum.
+    hid = receipt_seed_history()
+    clocks = [
+        {"r1": 0, "r2": 0},
+        {"r1": 1, "r2": 0},
+        {"r1": 1, "r2": 1},
+        {"r1": 2, "r2": 1},
+        {"r1": 2, "r2": 1},   # identical resend
+        {"r1": 2, "r2": 1},   # identical resend
+        {"r1": 0, "r2": 0},   # stale, must 409
+        {"r1": 1, "r2": 1},   # stale once any greater one landed
+    ]
+    barrier = threading.Barrier(len(clocks))
+
+    def report(clock):
+        c = TestClient(app)
+        barrier.wait()
+        return c.post(
+            f"/api/histories/{hid}/receipts",
+            json={"replica_id": "r1", "known_clock": clock},
+        )
+
+    with ThreadPoolExecutor(max_workers=len(clocks)) as pool:
+        responses = list(pool.map(report, clocks))
+
+    statuses = sorted(r.status_code for r in responses)
+    assert all(s in (200, 409) for s in statuses), [r.text for r in responses]
+    # The two resends of (2,1) plus the first successful arrival of it all
+    # succeed; at least the maximum clock's submission must be among them.
+    assert 200 in statuses
+    got = hist_receipts_get(hid).json()
+    assert got["receipts"][0]["known_clock"] == {"r1": 2, "r2": 1}
+
+    # Two genuinely conflicting heights racing: BEGIN IMMEDIATE plus the
+    # 30s busy timeout fully serialises the two transactions.  Whichever
+    # order the locks are granted in, the greatest clock wins and is never
+    # lowered: (a) big first -> the stale smaller one is re-checked against
+    # the committed row and gets 409; (b) small first -> it succeeds and the
+    # greater one is a forward move and also succeeds.  Repeat to exercise
+    # both lock orderings.
+    saw_small_409 = False
+    saw_both_200 = False
+    for _ in range(10):
+        hid2 = receipt_seed_history()
+        b = threading.Barrier(2)
+
+        def one(clock):
+            c = TestClient(app)
+            b.wait()
+            return c.post(
+                f"/api/histories/{hid2}/receipts",
+                json={"replica_id": "r1", "known_clock": clock},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_big = pool.submit(one, {"r1": 2, "r2": 1})
+            f_small = pool.submit(one, {"r1": 1, "r2": 0})
+            r_big = f_big.result()
+            r_small = f_small.result()
+
+        # The maximum clock always ends up persisted and never regresses...
+        assert hist_receipts_get(hid2).json()["receipts"][0][
+            "known_clock"
+        ] == {"r1": 2, "r2": 1}
+        assert r_big.status_code == 200, r_big.text
+        # ...while the stale report either lost the race (409 against the
+        # committed bigger clock) or serialised ahead of it (200).
+        assert r_small.status_code in (200, 409), r_small.text
+        if r_small.status_code == 409:
+            assert r_small.json()["detail"][0]["code"] == "receipt_regressed"
+            saw_small_409 = True
+        else:
+            saw_both_200 = True
+
+    # Both serialisation orders were actually observed across the hammering.
+    assert saw_small_409 and saw_both_200
+
+
+def test_receipts_concurrent_reports_for_distinct_replicas_both_win():
+    hid = receipt_seed_history()
+    barrier = threading.Barrier(2)
+
+    def report(replica):
+        c = TestClient(app)
+        barrier.wait()
+        return c.post(
+            f"/api/histories/{hid}/receipts",
+            json={"replica_id": replica,
+                  "known_clock": {"r1": 2, "r2": 1}},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(report, ["r1", "r2"])
+        )
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    assert hist_receipts_get(hid).json()["stable_clock"] == {"r1": 2, "r2": 1}
+
+
+def test_receipts_concurrent_reads_never_mix_pre_post_admission_sets():
+    hid = receipt_seed_history()
+    assert hist_receipt(hid, "r1", {"r1": 2, "r2": 1}).status_code == 200
+    assert hist_receipt(hid, "r2", {"r1": 1, "r2": 0}).status_code == 200
+
+    def read_until_done(stop):
+        c = TestClient(app)
+        while not stop.is_set():
+            data = c.get(f"/api/histories/{hid}/receipts").json()
+            replicas = [x["replica_id"] for x in data["receipts"]]
+            # One snapshot: every receipt clock and the stable_clock must
+            # cover exactly the replica set the same response lists.
+            for item in data["receipts"]:
+                assert set(item["known_clock"]) == set(replicas)
+            assert set(data["stable_clock"]) == set(replicas)
+            assert replicas in (["r1", "r2"], ["r1", "r2", "r3"])
+        return True
+
+    stop = threading.Event()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read_until_done, stop) for _ in range(4)]
+        time.sleep(0.05)
+        r = hist_admit(hid, "r3")
+        assert r.status_code == 200, r.text
+        time.sleep(0.05)
+        stop.set()
+        assert all(f.result() for f in futures)
+
+    data = hist_receipts_get(hid).json()
+    assert [x["replica_id"] for x in data["receipts"]] == ["r1", "r2", "r3"]
+
+
+def test_receipts_concurrent_with_admission_serialise_consistently():
+    hid = receipt_seed_history()
+    barrier = threading.Barrier(2)
+
+    def admit():
+        c = TestClient(app)
+        barrier.wait()
+        return c.post(
+            f"/api/histories/{hid}/replicas", json={"replica_id": "r3"}
+        )
+
+    def report():
+        c = TestClient(app)
+        barrier.wait()
+        # Two-component report racing admission: it must either land before
+        # admission (200, later patched with r3=0) or after (422 coverage);
+        # it can never corrupt the receipt set.
+        return c.post(
+            f"/api/histories/{hid}/receipts",
+            json={"replica_id": "r1", "known_clock": {"r1": 2, "r2": 1}},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_admit = pool.submit(admit)
+        f_report = pool.submit(report)
+        r_admit = f_admit.result()
+        r_report = f_report.result()
+
+    assert r_admit.status_code == 200, r_admit.text
+    assert r_report.status_code in (200, 422)
+
+    data = hist_receipts_get(hid).json()
+    assert set(data["stable_clock"]) == {"r1", "r2", "r3"}
+    if r_report.status_code == 200:
+        r1 = data["receipts"][0]["known_clock"]
+        assert r1 == {"r1": 2, "r2": 1, "r3": 0}

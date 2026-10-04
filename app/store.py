@@ -4,6 +4,10 @@ Each history is one table row holding the fixed ``replica_ids`` and the full
 event list (canonical JSON).  Import sessions are one row each: the owning
 history id, an ``open``/``closed`` status and the staged events (canonical
 JSON), so an interrupted staging process can be resumed after a restart.
+Delivery receipts are one row per (history, receiving replica): the causal
+prefix clock the receiving replica has acknowledged, so the stable watermark
+(minimum over every receiver, unreported receivers counting as all zeros)
+survives restarts too.
 Every request opens a short-lived connection:
 
 * writes take a ``BEGIN IMMEDIATE`` transaction, which acquires the database
@@ -42,6 +46,12 @@ CREATE TABLE IF NOT EXISTS import_sessions (
     history_id  TEXT NOT NULL,
     status      TEXT NOT NULL,
     events      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS receipts (
+    history_id  TEXT NOT NULL,
+    replica_id  TEXT NOT NULL,
+    clock       TEXT NOT NULL,
+    PRIMARY KEY (history_id, replica_id)
 );
 """
 
@@ -116,6 +126,9 @@ def read_transaction() -> Iterator[sqlite3.Connection]:
                 "WHERE type = 'table' AND name IN ('histories', "
                 "'import_sessions')"
             ).fetchone()[0]
+            # The receipts table is an add-on; read paths tolerate its
+            # absence so an upgraded volume still reads histories before the
+            # first new-code write has lazily created it.
             ready = tables == 2
         except sqlite3.OperationalError:
             ready = False
@@ -307,3 +320,82 @@ def select_sessions_for_update(
         "WHERE history_id = ? ORDER BY id",
         (history_id,),
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Delivery receipts: one acknowledged causal-prefix clock per receiver
+# ---------------------------------------------------------------------------
+
+
+def select_receipts_for_update(
+    conn: sqlite3.Connection, history_id: str
+) -> list[sqlite3.Row]:
+    """All delivery receipts of one history, locked in the write transaction.
+
+    Each row carries the receiving replica_id and its acknowledged clock
+    (canonical JSON).  New receivers have no row and are projected to an
+    all-zero clock by the caller; a replica admission adds the new zero
+    component to every already-persisted clock in the same transaction.
+    """
+
+    return conn.execute(
+        "SELECT history_id, replica_id, clock FROM receipts "
+        "WHERE history_id = ? ORDER BY replica_id",
+        (history_id,),
+    ).fetchall()
+
+
+def select_receipts_snapshot(
+    conn: sqlite3.Connection, history_id: str
+) -> list[sqlite3.Row]:
+    """All delivery receipts of one history on one shared read snapshot.
+
+    Read alongside the history row inside one deferred transaction so the
+    returned replica set and receipts can never come from different
+    committed states.  The receipts table may be missing on a not-yet-upgraded
+    volume; that reads as "no receipts yet" rather than an error.
+    """
+
+    try:
+        return conn.execute(
+            "SELECT history_id, replica_id, clock FROM receipts "
+            "WHERE history_id = ? ORDER BY replica_id",
+            (history_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_receipt(
+    conn: sqlite3.Connection, history_id: str, replica_id: str
+) -> sqlite3.Row | None:
+    """One receiver's persisted receipt within the caller's transaction."""
+
+    return conn.execute(
+        "SELECT history_id, replica_id, clock FROM receipts "
+        "WHERE history_id = ? AND replica_id = ?",
+        (history_id, replica_id),
+    ).fetchone()
+
+
+def upsert_receipt(
+    conn: sqlite3.Connection,
+    history_id: str,
+    replica_id: str,
+    clock: dict[str, int],
+) -> None:
+    """Persist (insert or replace) one receiver's acknowledged clock.
+
+    Runs inside the caller's serialised write transaction; the caller has
+    already validated and monotonicity-checked the clock against the same
+    committed state, so a replacement never moves any component backwards.
+    """
+
+    import json
+
+    conn.execute(
+        "INSERT INTO receipts (history_id, replica_id, clock) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(history_id, replica_id) DO UPDATE SET clock = excluded.clock",
+        (history_id, replica_id, json.dumps(clock, ensure_ascii=False)),
+    )

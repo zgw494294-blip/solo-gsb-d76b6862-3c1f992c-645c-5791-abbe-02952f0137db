@@ -149,6 +149,31 @@ read structure; subsequent writes still require the full clock (the server
 does not auto-fill missing request components), the admitted replica may
 then write from seq 1, the result survives restarts, and replicas can only be
 added -- never removed or renamed.
+
+A fourth family of endpoints (/api/histories/{id}/receipts) persistently
+records, for each receiving replica, the causal prefix it has acknowledged
+of one history, and answers for the stable watermark every receiver has in
+common.  A receipt submission carries the receiving replica_id and its
+known_clock: the clock must cover exactly the history's current replicas with
+non-negative integer components (booleans rejected), no component may exceed
+that source's highest committed seq, and every already-received event (its
+own seq at or below the matching component) must have a clock within the
+prefix, otherwise the submission is 422.  A receipt must never move any
+component backwards (409), while an identical retransmission succeeds and is
+idempotent; unknown history or a receiving replica that is not a member is
+404.  The query returns the receipts sorted by replica_id (a replica that has
+never reported is included with an all-zero clock) and a stable_clock whose
+components are the per-component minimum over every current receiver.
+Receipts live in the same SQLite database.  When a new replica is admitted,
+every earlier receipt gains a zero component for it and the new receiver
+starts at all zeros; this takes effect atomically with the replica-set and
+history expansion, and the watermark may consequently drop.  Concurrent
+submissions serialise on the same write lock, so validation and storage
+always use one committed state and a later transaction can never overwrite a
+greater progress; reads use one snapshot and can never mix the pre- and
+post-expansion replica sets with the matching receipts.  Staged import-session
+events are never part of the receipt range, and a failed submission changes
+nothing.
 """
 
 from __future__ import annotations
@@ -502,6 +527,42 @@ class AdmitReplicaRequest(BaseModel):
     ]
 
 
+class ReceiptRequest(BaseModel):
+    """One receiving replica's acknowledged causal prefix of one history.
+
+    The receiving replica_id is a current member of the history and
+    known_clock covers exactly the history's (current) replica_ids with
+    non-negative integer components; booleans are rejected by the strict
+    integer field.  Semantic validation (membership, component ceiling over
+    committed seqs, already-received events staying inside the prefix,
+    componentwise monotonicity against the stored receipt) happens under the
+    history's write lock.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    replica_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description="Non-empty ID of the receiving replica reporting receipt.",
+        ),
+    ]
+    known_clock: Annotated[
+        dict[
+            Annotated[str, Field(min_length=1)],
+            Annotated[int, Field(strict=True, ge=0)],
+        ],
+        Field(
+            ...,
+            description=(
+                "Causal prefix the receiving replica has acknowledged: one "
+                "non-negative integer component per current replica_id."
+            ),
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Error type
 # ---------------------------------------------------------------------------
@@ -570,6 +631,26 @@ class ReplicaAlreadyExistsError(Exception):
     def __init__(self, replica_id: str):
         super().__init__(f"replica {replica_id!r} already in replica_ids")
         self.replica_id = replica_id
+
+
+class ReceivingReplicaNotFound(Exception):
+    """The receipt's receiving replica is not a member of the history (404)."""
+
+    def __init__(self, replica_id: str):
+        super().__init__(f"receiving replica {replica_id!r} not in replica_ids")
+        self.replica_id = replica_id
+
+
+class ReceiptRegressedError(Exception):
+    """A receipt component moved backwards versus the stored one (HTTP 409)."""
+
+    def __init__(self, replica_id: str, components: dict[str, tuple[int, int]]):
+        super().__init__(
+            f"receipt of replica {replica_id!r} moves components backwards"
+        )
+        self.replica_id = replica_id
+        # replica_id -> (previous value, new value) for every regressed part.
+        self.components = components
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -1138,7 +1219,10 @@ def _admit_replica(
     committed: list[Event],
     sessions: list[tuple[str, list[Event]]],
     new_replica: str,
-) -> tuple[list[str], list[Event], list[list[Event]]]:
+    receipts: dict[str, dict[str, int]] | None = None,
+) -> tuple[
+    list[str], list[Event], list[list[Event]], dict[str, dict[str, int]]
+]:
     """Admit one new replica into a persistent history.
 
     The new replica is appended to ``replica_ids`` and every committed event
@@ -1148,6 +1232,13 @@ def _admit_replica(
     adding an all-zero component cannot change any key's verdict (every old
     event stays incomparable/ordered exactly as before -- the new replica's
     own writes are the only events that may later dominate on it).
+
+    Every persisted delivery receipt gains a zero component for the new
+    replica as well, so an old acknowledgement is expressed in the expanded
+    coordinate system without moving any existing component; the new
+    receiver itself starts at an implicit all-zero receipt (no row).  The
+    stable watermark may consequently drop to zero on the new component
+    until every receiver -- including the new replica -- catches up.
 
     Staging tolerates missing dependencies by construction, so unlike a merge
     no full-batch validation runs here: nothing about the staged events'
@@ -1186,7 +1277,17 @@ def _admit_replica(
     for ev in committed:
         ev.clock[new_replica] = 0
 
-    return expanded, committed, patched_sessions
+    # Extend every previously reported acknowledgement with a zero component
+    # for the new replica; the receiver's prior components never move.  The
+    # new replica itself has no row and is projected to all zeros by the
+    # receipts view, so its own first report can never "regress".
+    patched_receipts: dict[str, dict[str, int]] = {}
+    for rid, clock in (receipts or {}).items():
+        patched = dict(clock)
+        patched[new_replica] = 0
+        patched_receipts[rid] = patched
+
+    return expanded, committed, patched_sessions, patched_receipts
 
 
 def _session_missing_ranges(
@@ -2191,6 +2292,164 @@ def plan_catchup(
 
 
 # ---------------------------------------------------------------------------
+# Persistent delivery receipts and the stable watermark
+# ---------------------------------------------------------------------------
+
+
+def validate_receipt_clock(
+    replica_ids: list[str],
+    events: list[Event],
+    receiving_replica: str,
+    known_clock: dict[str, int],
+    max_seq: dict[str, int],
+) -> None:
+    """Validate a receiver's acknowledged prefix against committed history.
+
+    The clock must cover exactly the history's current replica_ids with
+    non-negative integers (shape-wise, since the request schema already
+    enforces non-negative integer values, only coverage can still fail here)
+    and no component may exceed that source's highest committed seq.
+    Moreover, an already-received event -- one whose own seq is at or below
+    the receiver's component for its source -- must not claim knowledge beyond
+    the acknowledged prefix: every clock component of such an event must stay
+    at or below the matching known_clock component.  Only committed events
+    count: events still staged in import sessions are never part of the
+    receipt range.  Any violation is a BatchError (-> 422).
+    """
+
+    replica_set = set(replica_ids)
+    clock_keys = set(known_clock)
+
+    errors: list[dict] = []
+    missing = sorted(replica_set - clock_keys)
+    if missing:
+        errors.append(
+            _err(
+                "known_clock_coverage",
+                f"known_clock must cover exactly all replica_ids; missing "
+                f"components for {missing}",
+            )
+        )
+    extra = sorted(clock_keys - replica_set)
+    if extra:
+        errors.append(
+            _err(
+                "known_clock_coverage",
+                f"known_clock must cover exactly all replica_ids; unexpected "
+                f"components {extra}",
+            )
+        )
+    if errors:
+        raise BatchError(errors)
+
+    over = [
+        f"{rid!r}: known_clock {known_clock[rid]} > highest committed seq "
+        f"{max_seq[rid]}"
+        for rid in replica_ids
+        if known_clock[rid] > max_seq[rid]
+    ]
+    if over:
+        raise BatchError(
+            [
+                _err(
+                    "known_clock_ahead_of_history",
+                    "known_clock component exceeds that source's highest "
+                    "committed seq; " + "; ".join(over),
+                )
+            ]
+        )
+
+    # The already-received events must stay inside the acknowledged prefix.
+    for ev in events:
+        if ev.seq > known_clock[ev.replica_id]:
+            continue
+        beyond = {
+            rid: ev.clock[rid]
+            for rid in replica_ids
+            if ev.clock[rid] > known_clock[rid]
+        }
+        if beyond:
+            raise BatchError(
+                [
+                    _err(
+                        "clock_exceeds_known_clock",
+                        f"event already received by {receiving_replica!r} "
+                        f"(replica {ev.replica_id!r}, seq {ev.seq} <= "
+                        f"known_clock {known_clock[ev.replica_id]}) but its "
+                        f"clock {ev.clock} exceeds the acknowledged prefix; "
+                        f"components beyond it: {beyond}",
+                    )
+                ]
+            )
+
+
+def check_receipt_monotonic(
+    replica_ids: list[str],
+    receiving_replica: str,
+    previous: dict[str, int] | None,
+    known_clock: dict[str, int],
+) -> None:
+    """Reject a receipt that moves any component backwards (409).
+
+    ``previous`` is None when this receiver has never reported; it then
+    implicitly occupies the all-zero prefix, which every non-negative clock
+    dominates, so the first submission can never regress.  Raises with the
+    replica_id and every regressed component as (previous, new) pairs.
+    """
+
+    if previous is None:
+        return
+    regressed = {
+        rid: (previous.get(rid, 0), known_clock[rid])
+        for rid in replica_ids
+        if known_clock[rid] < previous.get(rid, 0)
+    }
+    if regressed:
+        raise ReceiptRegressedError(receiving_replica, regressed)
+
+
+def receipts_state(
+    history_id: str,
+    replica_ids: list[str],
+    rows: list[object],
+) -> dict:
+    """Build the receipts/watermark view from persisted receipt rows.
+
+    Every current replica appears in ``receipts`` sorted by replica_id; a
+    replica without a row (it has never reported, or it was just admitted)
+    counts as an all-zero acknowledgement.  ``stable_clock`` takes the
+    per-component minimum over all those receivers.  Rows are parsed
+    defensively: stored clocks are canonical, but a zero default covers a row
+    written before some later replica admission even outside the admission
+    path.
+    """
+
+    stored: dict[str, dict] = {}
+    for row in rows:
+        stored[row["replica_id"]] = json.loads(row["clock"])
+
+    receipts: list[dict] = []
+    clocks: dict[str, dict[str, int]] = {}
+    for rid in sorted(replica_ids):
+        raw = stored.get(rid, {})
+        clock = {member: int(raw.get(member, 0)) for member in replica_ids}
+        clocks[rid] = clock
+        receipts.append({"replica_id": rid, "known_clock": clock})
+
+    # Per-component minimum over every receiver; the list always covers all
+    # current replicas (unreported ones project to all zeros), so the first
+    # receiver seeds the fold and absent reporters naturally pull it to zero.
+    stable = {member: min(clocks[rid][member] for rid in replica_ids)
+              for member in replica_ids}
+
+    return {
+        "id": history_id,
+        "receipts": receipts,
+        "stable_clock": {rid: stable[rid] for rid in replica_ids},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Routes / error handling
 # ---------------------------------------------------------------------------
 
@@ -2325,6 +2584,54 @@ async def replica_already_exists_handler(
                         "admitted once"
                     ),
                     "replica_id": exc.replica_id,
+                }
+            ]
+        },
+    )
+
+
+@app.exception_handler(ReceivingReplicaNotFound)
+async def receiving_replica_not_found_handler(
+    request: Request, exc: ReceivingReplicaNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "receiving_replica_not_found",
+                    "message": (
+                        f"receiving replica {exc.replica_id!r} is not a "
+                        "member of this history's replica_ids"
+                    ),
+                    "replica_id": exc.replica_id,
+                }
+            ]
+        },
+    )
+
+
+@app.exception_handler(ReceiptRegressedError)
+async def receipt_regressed_handler(
+    request: Request, exc: ReceiptRegressedError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": [
+                {
+                    "code": "receipt_regressed",
+                    "message": (
+                        f"the receipt of receiving replica "
+                        f"{exc.replica_id!r} moves one or more components "
+                        "backwards; each component must be greater than or "
+                        "equal to the previously acknowledged one"
+                    ),
+                    "replica_id": exc.replica_id,
+                    "components": {
+                        rid: {"previous": old, "new": new}
+                        for rid, (old, new) in sorted(exc.components.items())
+                    },
                 }
             ]
         },
@@ -2732,8 +3039,18 @@ def admit_history_replica(history_id: str, body: AdmitReplicaRequest) -> dict:
             (srow["id"], _load_session_row(srow, replica_ids)[2])
             for srow in srows
         ]
-        expanded, patched_committed, patched_sessions = _admit_replica(
-            replica_ids, committed, sessions, body.replica_id
+        rrows = store.select_receipts_for_update(conn, history_id)
+        receipts = {
+            rrow["replica_id"]: json.loads(rrow["clock"]) for rrow in rrows
+        }
+        expanded, patched_committed, patched_sessions, patched_receipts = (
+            _admit_replica(
+                replica_ids,
+                committed,
+                sessions,
+                body.replica_id,
+                receipts,
+            )
         )
         store.update_replica_ids_and_events(
             conn,
@@ -2745,7 +3062,112 @@ def admit_history_replica(history_id: str, body: AdmitReplicaRequest) -> dict:
             store.update_session_events(
                 conn, srow["id"], _canonical_events(patched, expanded)
             )
+        # Persist the extended acknowledgements in the same transaction: a
+        # reader can never see the expanded replica set together with an old
+        # (unpatched) receipt clock, and the watermark drops atomically.
+        for rid, clock in patched_receipts.items():
+            store.upsert_receipt(conn, hid, rid, clock)
         return _history_state(hid, expanded, patched_committed)
+
+
+# ---------------------------------------------------------------------------
+# Delivery receipts (/api/histories/{id}/receipts)
+#
+# Each receiving replica persistently reports the causal prefix of the
+# committed history it has acknowledged.  A submission is validated and
+# stored inside the same BEGIN IMMEDIATE transaction (with the history row
+# locked) as every other mutation: the coverage/ceiling/prefix checks and the
+# monotonicity comparison against the stored receipt use one committed state,
+# and concurrent submissions serialise so a later one can never overwrite a
+# greater progress.  Reads of history plus receipts share one snapshot, so a
+# query can never pair the pre-admission replica set with post-admission
+# receipts (or vice versa).  Staged import-session events never count as
+# received, and any failure rolls the transaction back.
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/histories/{history_id}/receipts",
+    tags=["receipts"],
+    response_model=None,
+)
+def submit_history_receipt(history_id: str, body: ReceiptRequest) -> dict:
+    """Record one receiving replica's acknowledged causal prefix.
+
+    The request carries the receiving ``replica_id`` and its
+    ``known_clock``: the clock must cover exactly the history's current
+    replicas with non-negative integer components (booleans rejected at the
+    schema level), no component may exceed that source's highest committed
+    seq, and every already-received committed event (its own seq at or below
+    the matching component) must have a clock within the prefix -- staged
+    import-session events do not count.  Violations are 422.  Against the
+    stored receipt the new clock must move no component backwards (409); an
+    identical retransmission is accepted and changes nothing.  Unknown
+    history or a non-member receiving replica is 404.  The response is the
+    full receipts view: all receivers sorted by replica_id (unreported ones
+    all zero) and the stable per-component minimum.
+    """
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, events = _load_row(row)
+        if body.replica_id not in set(replica_ids):
+            raise ReceivingReplicaNotFound(body.replica_id)
+
+        # Validation and persistence use this same locked committed state: a
+        # concurrent merge/admission cannot move the ceiling or replica set
+        # between the check and the write.
+        max_seq = _max_seq_by_replica(replica_ids, events)
+        validate_receipt_clock(
+            replica_ids,
+            events,
+            body.replica_id,
+            body.known_clock,
+            max_seq,
+        )
+        prior_row = store.get_receipt(conn, hid, body.replica_id)
+        prior = json.loads(prior_row["clock"]) if prior_row is not None else None
+        check_receipt_monotonic(
+            replica_ids, body.replica_id, prior, body.known_clock
+        )
+
+        canonical_clock = {rid: body.known_clock[rid] for rid in replica_ids}
+        store.upsert_receipt(conn, hid, body.replica_id, canonical_clock)
+        rows = store.select_receipts_for_update(conn, hid)
+        return receipts_state(hid, replica_ids, rows)
+
+
+@app.get(
+    "/api/histories/{history_id}/receipts",
+    tags=["receipts"],
+    response_model=None,
+)
+def read_history_receipts(history_id: str) -> dict:
+    """Return every receiver's acknowledged prefix and the stable watermark.
+
+    ``receipts`` lists the history's current replicas sorted by replica_id,
+    each with its persisted ``known_clock``; a replica that has never
+    reported (or that was admitted only just now) is included with an
+    all-zero clock.  ``stable_clock`` takes, component by component, the
+    minimum over all those receivers, so it is the prefix every receiver has
+    in common -- it can be all zeros before the first reports and may drop
+    when a new replica is admitted.  The history row and the receipts come
+    from one shared read snapshot, so the replica set, receipt clocks and
+    watermark can never straddle an admission.  Staged events never affect
+    the view.  Unknown history -> 404.
+    """
+
+    with store.read_transaction() as conn:
+        if conn is None:
+            raise HistoryNotFound(history_id)
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        replica_ids: list[str] = json.loads(row["replica_ids"])
+        rows = store.select_receipts_snapshot(conn, history_id)
+        return receipts_state(history_id, replica_ids, rows)
 
 
 # ---------------------------------------------------------------------------
